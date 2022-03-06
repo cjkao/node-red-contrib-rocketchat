@@ -65,7 +65,7 @@ module.exports = ({ host, user, token }) => ({
     try {
       let endpoint;
       switch (type) {
-        case "g":
+        case "p":
           endpoint = "groups";
           break;
         case "d":
@@ -78,8 +78,8 @@ module.exports = ({ host, user, token }) => ({
 
       const { data } = await axios.get(`${host}/api/v1/${endpoint}.history`, {
         params: {
-          roomId,
-          oldest,
+          'roomId': roomId,
+          'oldest': oldest,
         },
         headers: {
           "X-Auth-Token": token,

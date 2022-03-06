@@ -1,58 +1,221 @@
+const WebSocket = require("ws");
+const EJSON = require("ejson");
+const api = require("./rocketchat");
+
 module.exports = function (RED) {
   "use strict";
 
-  function RocketChatIn(n) {
-    RED.nodes.createNode(this, n);
+  function RocketChatIn(config) {
+    RED.nodes.createNode(this, config);
     const node = this;
-    const RocketChatApi = require('./rocket-chat').RocketChatApi;
-    let previous_time = Date.parse(new Date());
 
-    node.on('input', function (msg) {
-      node.server = RED.nodes.getNode(n.server); // Retrieve the config node
-      if (node.server.host.indexOf('http') < 0) {
-        node.server.host = 'http://' + node.server.host;
+    const { server, origin, room, roomType, roomData } = config;
+    node.server = RED.nodes.getNode(server);
+
+    if (node.server == null) {
+      node.status({ fill: "red", shape: "ring", text: "rocketchat-in.errors.invalid-data" });
+      return;
+    }
+
+    const { host: configHost, user, token } = node.server;
+
+    const url = new URL(configHost);
+
+    const useSsl = /^https/i.test(url.protocol);
+
+    const endpoint = `${useSsl ? "wss://" : "ws://"}${url.host}/websocket`;
+
+    let roomId;
+    if (origin === "room") {
+      if (roomType === "form") {
+        const { i } = JSON.parse(roomData);
+        roomId = i;
+      } else {
+        // roomId = RED.util.evaluateNodeProperty(room, roomType, this, msg);
+        roomId = RED.util.evaluateNodeProperty(room, roomType, this, {});
       }
-      let url;
+    } else if (origin === "user") {
+      roomId = "__my_messages__";
+    }
+
+    const apiInstance = api({ host: configHost, user, token });
+
+    const processUnreadMessages = async () => {
       try {
-        url = new URL(node.server.host);
-      } catch (e) {
-        node.error(e, msg);
-      }
-      let rocketChatApi = new RocketChatApi(url.protocol, url.hostname, url.port, node.server.user, node.server.credentials.password, "v1");
-      rocketChatApi.getPublicRooms(function (err, body) {
-        if (!err) {
-          node.status({fill: "blue", shape: "dot", text: "Connected"});
-          let rooms = body.channels.filter(f => f.name == n.room);
-          if (rooms.length === 1) {
-            rocketChatApi.getUnreadMsg(rooms[0]._id, function (err2, body2) {
-              if (!err2) {
-                let ts_max = previous_time;
-                for (let i=0, j=body2.messages.length; i<j; i++) {
-                  let ts = Date.parse(body2.messages[i].ts);
-                  if (ts > previous_time) {
-                    node.send({payload: body2.messages[i].msg});
-                  }
-                  ts_max = Math.max(ts_max, ts);
+        if (origin === "user") {
+          const { success, update = [] } = await apiInstance.getSubscriptions();
+          if (success) {
+            update.forEach(async ({ rid, ls, unread, t }) => {
+              if (t === "d" && unread > 0) {
+                const { success, messages = [] } = await apiInstance.getUnreadMessages({ roomId: rid, oldest: ls, type: t });
+                if (success) {
+                  messages.forEach(async (message) => {
+                    const {
+                      u: { _id: fromUser },
+                    } = message;
+                    if (fromUser !== user) {
+                      node.send({
+                        payload: message,
+                      });
+                    }
+                  });
+                  await apiInstance.markAsRead({ rid });
                 }
-                previous_time = ts_max;
-              } else {
-                node.error(err2, msg);
-                node.status({fill: "red", shape: "ring", text: "Error: " + err2});
               }
             });
-          } else {
-            let e = "Rocket.Chat room not found: " + n.room;
-            node.error(e, msg);
-            node.status({fill: "red", shape: "ring", text: "Error: " + e});
           }
-        } else {
-          node.error("Failed to get Rocket.Chat public rooms. " + err, msg);
-          node.status({fill: "red", shape: "ring", text: "Error: " + err});
+        } else if (origin === "room") {
+          const {
+            success,
+            subscription: { unread, ls, t },
+            ...rest
+          } = await apiInstance.getSubscription({ roomId });
+          if (success) {
+            const { success, messages = [] } = await apiInstance.getUnreadMessages({ roomId, oldest: ls, type: t });
+            if (success) {
+              messages.forEach(async (message) => {
+                const {
+                  u: { _id: fromUser },
+                } = message;
+                if (fromUser !== user) {
+                  node.send({
+                    payload: message,
+                  });
+                }
+              });
+              await apiInstance.markAsRead({ rid: roomId });
+            }
+          }
         }
-      });
-    });
+      } catch (error) {
+        node.error(RED._("rocketchat-in.errors.error-processing", error));
+        node.status({
+          fill: "red",
+          shape: "ring",
+          text: RED._("rocketchat-in.errors.error-processing", error),
+        });
+      }
+    };
+
+    const startListening = () => {
+      try {
+        node.status({ fill: "yellow", shape: "ring" });
+        processUnreadMessages();
+
+        let ws = new WebSocket(endpoint);
+
+        const wsSend = (message) => {
+          ws.send(EJSON.stringify(message));
+        };
+
+        const doLogin = () => {
+          const loginMessage = {
+            msg: "method",
+            method: "login",
+            params: [{ resume: token }],
+            id: "1",
+          };
+          wsSend(loginMessage);
+        };
+
+        const subscribeMessages = () => {
+          wsSend({
+            msg: "sub",
+            id: "2",
+            name: "stream-room-messages",
+            params: [roomId, true],
+          });
+          node.status({ fill: "green", shape: "dot" });
+        };
+
+        const heartbeat = () => {
+          clearTimeout(ws.pingTimeout);
+          ws.pingTimeout = setTimeout(() => {
+            node.status({ fill: "red", shape: "dot" });
+            ws.terminate();
+          }, 30000 + 2500);
+        };
+
+        ws.on("open", () => {
+          heartbeat();
+          wsSend({
+            msg: "connect",
+            version: "1",
+            support: ["1"],
+          });
+        });
+
+        ws.on("close", () => {
+          // try to reconect in 10 seconds
+          node.status({ fill: "red", shape: "dot" });
+          ws.terminate();
+          setTimeout(startListening, 10000);
+        });
+
+        // Safelly handle ws errors so it doesn't break the application
+        // Will forward internal errors to catch
+        ws.onerror = () => { };
+
+        ws.on("message", (data) => {
+          const { id, msg, error, fields } = EJSON.parse(data);
+
+          switch (msg) {
+            case "connected":
+              doLogin();
+              break;
+            case "ping":
+              wsSend({ msg: "pong" });
+              heartbeat();
+              break;
+            case "result":
+              if (id === "1") {
+                // Login
+                if (error != null) {
+                  node.error(RED._("rocketchat-in.errors.error-processing", error));
+                  node.status({
+                    fill: "red",
+                    shape: "ring",
+                    text: RED._("rocketchat-in.errors.error-processing", error),
+                  });
+                } else {
+                  subscribeMessages();
+                }
+              }
+              break;
+            case "changed":
+              if (fields != null) {
+                const { eventName, args } = fields;
+                if (eventName === roomId) {
+                  const [message] = args;
+                  const {
+                    rid,
+                    u: { _id: fromUser },
+                  } = message;
+                  if (fromUser !== user) {
+                    node.send({
+                      payload: message,
+                    });
+                  }
+                  apiInstance.markAsRead({ rid });
+                }
+              }
+              break;
+            default:
+              break;
+          }
+        });
+      } catch (error) {
+        node.error(RED._("rocketchat-in.errors.error-processing", error));
+        node.status({
+          fill: "red",
+          shape: "ring",
+          text: RED._("rocketchat-in.errors.error-processing", error),
+        });
+      }
+    };
+
+    startListening();
   }
 
   RED.nodes.registerType("rocketchat-in", RocketChatIn);
-
 };

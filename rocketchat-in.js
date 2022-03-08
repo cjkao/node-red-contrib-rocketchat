@@ -84,6 +84,13 @@ module.exports = function (RED) {
                 }
               });
               await apiInstance.markAsRead({ rid: roomId });
+            } else {
+              node.warn("rocketchat-in.errors.error-processing" + messages.error);
+              node.status({
+                fill: "red",
+                shape: "ring",
+                text: RED._("rocketchat-in.errors.error-processing", messages.error),
+              });
             }
           }
         }
